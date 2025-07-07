@@ -10,7 +10,9 @@ class GameStatus(str, enum.Enum):
     in_progress = "in_progress"
     finished = "finished"
 
+# PUBLIC_INTERFACE
 class User(Base):
+    """SQLAlchemy model for user accounts."""
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True, nullable=False)
@@ -21,7 +23,9 @@ class User(Base):
     games2 = relationship("Game", foreign_keys="[Game.user2_id]", back_populates="user2")
     moves = relationship("Move", back_populates="user")
 
+# PUBLIC_INTERFACE
 class Game(Base):
+    """SQLAlchemy model for a tic tac toe game between two users."""
     __tablename__ = "games"
     id = Column(Integer, primary_key=True, index=True)
     user1_id = Column(Integer, ForeignKey("users.id"))
@@ -34,7 +38,9 @@ class Game(Base):
     user2 = relationship("User", foreign_keys=[user2_id], back_populates="games2")
     moves = relationship("Move", back_populates="game")
 
+# PUBLIC_INTERFACE
 class Move(Base):
+    """SQLAlchemy model representing a move in a tic tac toe game."""
     __tablename__ = "moves"
     id = Column(Integer, primary_key=True, index=True)
     game_id = Column(Integer, ForeignKey("games.id"), nullable=False)

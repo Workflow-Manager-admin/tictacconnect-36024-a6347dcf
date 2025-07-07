@@ -1,9 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from . import models
+from .models import Base
 from .database import engine
 
-app = FastAPI()
+app = FastAPI(
+    title="Tic Tac Toe Backend API",
+    description="Handles user, game logic, and moves for the fullstack tic tac toe game.",
+    version="1.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,11 +19,17 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup():
-    # Creates tables if they don't exist already (safe for dev/demo)
-    models.Base.metadata.create_all(bind=engine)
+    """
+    Creates all database tables for the application if they don't exist.
+    Uses SQLAlchemy metadata for automatic table management.
+    Called once at FastAPI app startup.
+    """
+    Base.metadata.create_all(bind=engine)
 
+# PUBLIC_INTERFACE
 @app.get("/")
 def health_check():
+    """Health check endpoint to verify backend is running."""
     return {"message": "Healthy"}
 
 """
