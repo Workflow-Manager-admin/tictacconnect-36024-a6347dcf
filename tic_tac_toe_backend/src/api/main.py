@@ -16,6 +16,14 @@ from .schemas import (
     MoveCreate, MoveRead,
     UserHistory, GameSummary,
 )
+from .game_logic import (
+    InvalidMove, NotPlayersTurn, CellOccupied,
+    create_board_from_moves,
+    check_winner,
+    validate_and_get_next_player,
+    is_cell_empty,
+    is_board_full,
+)
 import os
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "verysecretkey")
@@ -210,64 +218,62 @@ def get_game_detail(game_id: int, db: Session = Depends(get_db), current_user: U
 @app.post("/moves/", response_model=MoveRead, summary="Make a move in a game", tags=["Move"])
 def make_move(move_in: MoveCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """
-    Submit a move. Validates it's user's turn and spot is empty.
+    Submit a move. Validates it's user's turn, cell is empty, and applies game rules:
+    - Validates player turn
+    - Checks cell not taken
+    - Records the move
+    - Updates game status (win/draw/continue)
+    Persists all changes in the DB.
     """
-    # Check game exists/participation
+    # 1. Fetch game and ensure user permission/participation
     game = db.query(Game).filter(Game.id == move_in.game_id).first()
     if not game or (current_user.id not in [game.user1_id, game.user2_id]):
         raise HTTPException(status_code=404, detail="Game not found/permission denied.")
-    # Only allow moves if in progress
+    # 2. Ensure game is in progress and opponent joined
     if game.status != GameStatus.in_progress:
         raise HTTPException(status_code=400, detail="Game is not in progress.")
-    # Whose turn?
+    if game.user2_id is None:
+        raise HTTPException(status_code=403, detail="Second player hasn't joined this game yet.")
+    # 3. Fetch moves, construct logic board, enforce turn order and cell occupancy
     moves = db.query(Move).filter(Move.game_id == game.id).order_by(Move.move_number).all()
-    board = [[None for _ in range(3)] for _ in range(3)]
-    player_turn = game.user1_id if len(moves) % 2 == 0 else game.user2_id
-    if current_user.id != player_turn:
+    # Use new logic:
+    try:
+        validate_and_get_next_player(moves, game.user1_id, game.user2_id, current_user.id)
+        board = create_board_from_moves(moves, game.user1_id, game.user2_id)
+        is_cell_empty(board, move_in.row, move_in.col)
+    except NotPlayersTurn:
         raise HTTPException(status_code=400, detail="Not your turn.")
-    # Board fill
-    for m in moves:
-        board[m.row][m.col] = m.user_id
-    if board[move_in.row][move_in.col] is not None:
+    except CellOccupied:
         raise HTTPException(status_code=400, detail="Cell already taken.")
-    # Apply move
+    except InvalidMove as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # 4. Apply and persist move
     move = Move(
-        game_id=game.id, user_id=current_user.id,
-        row=move_in.row, col=move_in.col,
+        game_id=game.id,
+        user_id=current_user.id,
+        row=move_in.row,
+        col=move_in.col,
         move_number=len(moves) + 1,
     )
     db.add(move)
     db.commit()
     db.refresh(move)
-    # Update winner/status
-    board[move_in.row][move_in.col] = current_user.id
-    winner = check_winner(board, game.user1_id, game.user2_id)
-    if winner:
+    # 5. Recreate board including the new move and check for win/draw
+    moves_post = moves + [move]
+    board_post = create_board_from_moves(moves_post, game.user1_id, game.user2_id)
+    winner_id = check_winner(board_post, game.user1_id, game.user2_id)
+    game_ended = False
+    if winner_id:
         game.status = GameStatus.finished
-        game.winner_id = winner
-    elif len(moves) + 1 >= 9:
+        game.winner_id = winner_id
+        game_ended = True
+    elif is_board_full(moves_post):
         game.status = GameStatus.finished
-    db.commit()
+        game_ended = True
+    if game_ended:
+        db.commit()
     return move
 
-def check_winner(board, user1_id, user2_id):
-    """Returns winner user id if found else None."""
-    for player_id in [user1_id, user2_id]:
-        marker = player_id
-        # Rows
-        for i in range(3):
-            if all(board[i][j] == marker for j in range(3)):
-                return marker
-        # Columns
-        for j in range(3):
-            if all(board[i][j] == marker for i in range(3)):
-                return marker
-        # Diags
-        if all(board[i][i] == marker for i in range(3)):
-            return marker
-        if all(board[i][2 - i] == marker for i in range(3)):
-            return marker
-    return None
 
 # --- Get User Game History ---
 
