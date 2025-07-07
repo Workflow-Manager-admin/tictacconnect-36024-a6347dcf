@@ -1,7 +1,29 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from .models import Base
-from .database import engine
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+from .models import Base, User, Game, Move, GameStatus
+from .database import engine, get_db
+from .schemas import (
+    UserCreate, UserRead,
+    Token, TokenData,
+    GameCreate, GameRead, GameDetail,
+    MoveCreate, MoveRead,
+    UserHistory, GameSummary,
+)
+import os
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "verysecretkey")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
 app = FastAPI(
     title="Tic Tac Toe Backend API",
@@ -26,11 +48,249 @@ def on_startup():
     """
     Base.metadata.create_all(bind=engine)
 
+# --- Auth Helpers ---
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
 # PUBLIC_INTERFACE
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    """Dependency to get the current authenticated user from JWT token."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.username == token_data.username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
 @app.get("/")
 def health_check():
     """Health check endpoint to verify backend is running."""
     return {"message": "Healthy"}
+
+# --- User Registration ---
+
+# PUBLIC_INTERFACE
+@app.post("/register", response_model=UserRead, summary="User Registration", tags=["Auth"])
+def register(user_in: UserCreate, db: Session = Depends(get_db)):
+    """
+    Registers a new user. Username and email must be unique.
+    """
+    if db.query(User).filter((User.username == user_in.username) | (User.email == user_in.email)).first():
+        raise HTTPException(status_code=400, detail="Username or email already registered")
+    hashed_pw = get_password_hash(user_in.password)
+    user = User(username=user_in.username, email=user_in.email, hashed_password=hashed_pw)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+# --- User Login (JWT) ---
+
+# PUBLIC_INTERFACE
+@app.post("/login", response_model=Token, summary="Login to obtain access token", tags=["Auth"])
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    Authenticates user via username and password.
+    Returns JWT token for use in Authorization header.
+    """
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": user.username, "id": user.id})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# --- Authenticated User Me ---
+
+# PUBLIC_INTERFACE
+@app.get("/users/me", response_model=UserRead, summary="Current user info", tags=["User"])
+def read_me(current_user: User = Depends(get_current_user)):
+    """
+    Returns the currently authenticated user.
+    """
+    return current_user
+
+# --- Game Creation ---
+
+# PUBLIC_INTERFACE
+@app.post("/games/", response_model=GameRead, summary="Create new game", tags=["Game"])
+def create_game(game_in: GameCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Create a new game, optionally vs a specific opponent.
+    If opponent is not given, game is created with user2 as NULL ("waiting" status).
+    """
+    opponent = None
+    if game_in.opponent_username:
+        opponent = db.query(User).filter(User.username == game_in.opponent_username).first()
+        if not opponent:
+            raise HTTPException(status_code=404, detail="Opponent not found.")
+        if opponent.id == current_user.id:
+            raise HTTPException(status_code=400, detail="Cannot play a game against yourself.")
+        game = Game(user1_id=current_user.id, user2_id=opponent.id, status=GameStatus.in_progress)
+    else:
+        game = Game(user1_id=current_user.id, user2_id=None, status=GameStatus.waiting)
+    db.add(game)
+    db.commit()
+    db.refresh(game)
+    return game
+
+# --- Join Waiting Game ---
+
+@app.post("/games/join", response_model=GameRead, summary="Join a waiting game as opponent", tags=["Game"])
+def join_waiting_game(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Join an open waiting game if available (not already in a game).
+    """
+    waiting_game = db.query(Game).filter(Game.status == GameStatus.waiting, Game.user1_id != current_user.id).first()
+    if not waiting_game:
+        raise HTTPException(status_code=404, detail="No available games to join.")
+    waiting_game.user2_id = current_user.id
+    waiting_game.status = GameStatus.in_progress
+    db.commit()
+    db.refresh(waiting_game)
+    return waiting_game
+
+# --- List User's Games ---
+
+# PUBLIC_INTERFACE
+@app.get("/games/", response_model=List[GameRead], summary="List all games of current user", tags=["Game"])
+def list_my_games(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    List all games for which the current user is a player.
+    """
+    games = db.query(Game).filter((Game.user1_id == current_user.id) | (Game.user2_id == current_user.id)).order_by(Game.created_at.desc()).all()
+    return games
+
+# --- Get Game Details (w/ Moves) ---
+
+# PUBLIC_INTERFACE
+@app.get("/games/{game_id}", response_model=GameDetail, summary="Get details of a game including moves", tags=["Game"])
+def get_game_detail(game_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Get a game and its move list. Only allowed if you're a player in this game.
+    """
+    game = db.query(Game).filter(Game.id == game_id).first()
+    if not game or (game.user1_id != current_user.id and game.user2_id != current_user.id):
+        raise HTTPException(status_code=404, detail="Game not found or not permitted.")
+    moves = db.query(Move).filter(Move.game_id == game.id).order_by(Move.move_number).all()
+    return GameDetail(
+        id=game.id,
+        user1_id=game.user1_id,
+        user2_id=game.user2_id,
+        status=game.status,
+        created_at=game.created_at,
+        winner_id=game.winner_id,
+        moves=moves,
+    )
+
+# --- Make Move ---
+
+# PUBLIC_INTERFACE
+@app.post("/moves/", response_model=MoveRead, summary="Make a move in a game", tags=["Move"])
+def make_move(move_in: MoveCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Submit a move. Validates it's user's turn and spot is empty.
+    """
+    # Check game exists/participation
+    game = db.query(Game).filter(Game.id == move_in.game_id).first()
+    if not game or (current_user.id not in [game.user1_id, game.user2_id]):
+        raise HTTPException(status_code=404, detail="Game not found/permission denied.")
+    # Only allow moves if in progress
+    if game.status != GameStatus.in_progress:
+        raise HTTPException(status_code=400, detail="Game is not in progress.")
+    # Whose turn?
+    moves = db.query(Move).filter(Move.game_id == game.id).order_by(Move.move_number).all()
+    board = [[None for _ in range(3)] for _ in range(3)]
+    player_turn = game.user1_id if len(moves) % 2 == 0 else game.user2_id
+    if current_user.id != player_turn:
+        raise HTTPException(status_code=400, detail="Not your turn.")
+    # Board fill
+    for m in moves:
+        board[m.row][m.col] = m.user_id
+    if board[move_in.row][move_in.col] is not None:
+        raise HTTPException(status_code=400, detail="Cell already taken.")
+    # Apply move
+    move = Move(
+        game_id=game.id, user_id=current_user.id,
+        row=move_in.row, col=move_in.col,
+        move_number=len(moves) + 1,
+    )
+    db.add(move)
+    db.commit()
+    db.refresh(move)
+    # Update winner/status
+    board[move_in.row][move_in.col] = current_user.id
+    winner = check_winner(board, game.user1_id, game.user2_id)
+    if winner:
+        game.status = GameStatus.finished
+        game.winner_id = winner
+    elif len(moves) + 1 >= 9:
+        game.status = GameStatus.finished
+    db.commit()
+    return move
+
+def check_winner(board, user1_id, user2_id):
+    """Returns winner user id if found else None."""
+    for player_id in [user1_id, user2_id]:
+        marker = player_id
+        # Rows
+        for i in range(3):
+            if all(board[i][j] == marker for j in range(3)):
+                return marker
+        # Columns
+        for j in range(3):
+            if all(board[i][j] == marker for i in range(3)):
+                return marker
+        # Diags
+        if all(board[i][i] == marker for i in range(3)):
+            return marker
+        if all(board[i][2 - i] == marker for i in range(3)):
+            return marker
+    return None
+
+# --- Get User Game History ---
+
+# PUBLIC_INTERFACE
+@app.get("/history/", response_model=UserHistory, summary="Get user's game history", tags=["User"])
+def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Returns a summary of the user's games for history display.
+    """
+    games = db.query(Game).filter((Game.user1_id == current_user.id) | (Game.user2_id == current_user.id)).order_by(Game.created_at.desc()).all()
+    summaries = []
+    for g in games:
+        opponent_id = g.user2_id if g.user1_id == current_user.id else g.user1_id
+        opponent = db.query(User).filter(User.id == opponent_id).first() if opponent_id else None
+        winner = db.query(User).filter(User.id == g.winner_id).first() if g.winner_id else None
+        summaries.append(GameSummary(
+            id=g.id,
+            opponent=opponent.username if opponent else "(waiting)",
+            status=g.status,
+            created_at=g.created_at,
+            winner=winner.username if winner else None,
+        ))
+    return UserHistory(games=summaries)
 
 """
 Database configuration:
